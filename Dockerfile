@@ -18,6 +18,9 @@ RUN useradd --create-home --uid 10001 monitor \
     && chown -R monitor:monitor /app
 
 COPY --chown=monitor:monitor app ./app
+COPY --chown=monitor:monitor scripts ./scripts
+COPY --chown=monitor:monitor tests ./tests
+COPY --chown=monitor:monitor pyproject.toml ./pyproject.toml
 COPY --chown=monitor:monitor config.yaml ./config.yaml
 COPY --chown=monitor:monitor monitor.py ./monitor.py
 
