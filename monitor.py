@@ -1,181 +1,168 @@
 import json
 import logging
-import os
-import re
+import logging.handlers
 import sys
-from urllib.parse import urlparse
+from datetime import datetime, timezone
 
 import discord
 
-TOKEN = os.getenv("DISCORD_TOKEN")
-TARGET_CHANNEL_ID_RAW = os.getenv("DISCORD_TARGET_CHANNEL_ID")
+from app.behavior import BehaviorTracker
+from app.config import load_settings
+from app.db import Database
+from app.detection import evaluate_content
+from app.models import Reason, severity_for
 
-if not TOKEN:
-    raise RuntimeError("Missing required environment variable: DISCORD_TOKEN")
+ALERT_MARKER = "[MONITOR_ALERT]"
+settings = load_settings(require_discord=True)
 
-if not TARGET_CHANNEL_ID_RAW:
-    raise RuntimeError("Missing required environment variable: DISCORD_TARGET_CHANNEL_ID")
-
-try:
-    TARGET_CHANNEL_ID = int(TARGET_CHANNEL_ID_RAW)
-except ValueError as exc:
-    raise RuntimeError("DISCORD_TARGET_CHANNEL_ID must be numeric") from exc
-
+settings.log_file.parent.mkdir(parents=True, exist_ok=True)
 logger = logging.getLogger("discord_monitor")
 logger.setLevel(logging.INFO)
 logger.propagate = False
-
-formatter = logging.Formatter(
-    "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
-)
-
+formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 stdout_handler = logging.StreamHandler(sys.stdout)
 stdout_handler.setFormatter(formatter)
-logger.addHandler(stdout_handler)
-
-os.makedirs("/app/logs", exist_ok=True)
-file_handler = logging.FileHandler(
-    "/app/logs/discord_monitor.log",
-    encoding="utf-8",
-)
+file_handler = logging.handlers.TimedRotatingFileHandler(settings.log_file, when="midnight", backupCount=14, encoding="utf-8")
 file_handler.setFormatter(formatter)
+logger.handlers.clear()
+logger.addHandler(stdout_handler)
 logger.addHandler(file_handler)
 
-URL_PATTERN = re.compile(r"\b(?:https?://|www\.)[^\s<>\"']+", re.IGNORECASE)
-SUSPICIOUS_TLDS = (".tk", ".ml", ".ga")
-SUSPICIOUS_DOMAIN_KEYWORDS = ("gift", "free", "nitro", "steam")
-SOCIAL_ENGINEERING_KEYWORDS = (
-    "claim now",
-    "verify your account",
-    "account suspended",
-    "your account is suspended",
-    "suspended",
-)
-ALERT_MARKER = "[MONITOR_ALERT]"
-
-
-def normalize_url(url: str) -> str:
-    return url.rstrip(".,!?;:)]}\"'")
-
-
-def get_hostname(url: str) -> str:
-    candidate = url
-    if candidate.lower().startswith("www."):
-        candidate = "https://" + candidate
-
-    try:
-        hostname = urlparse(candidate).hostname
-    except ValueError:
-        return ""
-
-    return hostname.lower().rstrip(".") if hostname else ""
-
-
-def evaluate_content(text: str) -> tuple[bool, list[str]]:
-    if not text:
-        return False, []
-
-    reasons: list[str] = []
-    urls = [normalize_url(match.group(0)) for match in URL_PATTERN.finditer(text)]
-
-    for url in urls:
-        hostname = get_hostname(url)
-        if not hostname:
-            continue
-
-        for tld in SUSPICIOUS_TLDS:
-            if hostname.endswith(tld):
-                reasons.append(f"Suspicious domain TLD '{tld}': {hostname}")
-                break
-
-        for keyword in SUSPICIOUS_DOMAIN_KEYWORDS:
-            if keyword in hostname:
-                reasons.append(f"Suspicious domain keyword '{keyword}': {hostname}")
-
-    normalized_text = text.casefold()
-    for keyword in SOCIAL_ENGINEERING_KEYWORDS:
-        if keyword.casefold() in normalized_text:
-            reasons.append(f"Social-engineering phrase detected: '{keyword}'")
-
-    reasons = list(dict.fromkeys(reasons))
-    return bool(reasons), reasons
-
-
+db = Database(settings.db_path)
+behavior = BehaviorTracker(settings.raw)
 client = discord.Client()
+
+
+async def send_alert(payload: dict) -> None:
+    channel = client.get_channel(settings.target_channel_id)
+    if channel is None:
+        try:
+            channel = await client.fetch_channel(settings.target_channel_id)
+        except Exception:
+            logger.exception("Unable to resolve alert channel %s", settings.target_channel_id)
+            return
+    text = json.dumps(payload, ensure_ascii=False, indent=2)
+    if len(text) > 1800:
+        payload = dict(payload)
+        payload["content"] = str(payload.get("content", ""))[:250]
+        text = json.dumps(payload, ensure_ascii=False, indent=2)
+    try:
+        await channel.send(f"{ALERT_MARKER}\n```json\n{text}\n```")
+    except Exception:
+        logger.exception("Failed to send alert")
 
 
 @client.event
 async def on_ready():
-    logger.info(
-        "Successfully authenticated as %s (%s)",
-        client.user,
-        client.user.id,
-    )
-    logger.info("Configured alert channel: %s", TARGET_CHANNEL_ID)
+    logger.info("Authenticated as %s (%s)", client.user, getattr(client.user, "id", None))
+    logger.info("Alert channel: %s", settings.target_channel_id)
+    for guild in client.guilds:
+        db.upsert_guild(str(guild.id), guild.name, str(getattr(guild, "owner_id", "")) or None, getattr(guild, "member_count", None), True)
 
 
 @client.event
 async def on_message(message):
-    content = message.content or ""
-    author_id = getattr(message.author, "id", None)
+    content = getattr(message, "content", "") or ""
+    author_id = str(getattr(getattr(message, "author", None), "id", ""))
+    channel_id = str(getattr(getattr(message, "channel", None), "id", ""))
+    guild = getattr(message, "guild", None)
+    guild_id = str(getattr(guild, "id", "")) if guild else None
+    outgoing = bool(client.user and getattr(message.author, "id", None) == client.user.id)
+    direction = "SENT" if outgoing else "RECEIVED"
 
-    logger.info(
-        "MESSAGE | author_id=%s | content=%r",
-        author_id,
-        content,
+    logger.info("MESSAGE | %s | author=%s | content=%r", direction, author_id, content[:500])
+
+    if channel_id == str(settings.target_channel_id) and content.startswith(ALERT_MARKER):
+        return
+
+    new_contact = db.touch_contact(author_id, str(getattr(message, "author", ""))) if author_id else False
+    attachment_names = [str(getattr(a, "filename", "")) for a in getattr(message, "attachments", []) or []]
+    result = evaluate_content(content, settings.raw, outgoing=outgoing, attachment_names=attachment_names)
+    extra = behavior.message_reasons(content, outgoing=outgoing)
+
+    if guild is None and result.score > 0:
+        extra.append(Reason("dm_context", "Suspicious content was received/sent in a DM", int(settings.scoring.get("dm_context", 10))))
+
+    created_at = getattr(getattr(message, "author", None), "created_at", None)
+    if created_at is not None and result.score > 0:
+        try:
+            age_days = (datetime.now(timezone.utc) - created_at).days
+            if age_days < 14:
+                extra.append(Reason("new_account", f"Author account is approximately {age_days} days old", int(settings.scoring.get("new_account", 15))))
+        except Exception:
+            pass
+
+    if new_contact and not outgoing and result.score > 0:
+        extra.append(Reason("new_contact", "First observed message from this contact", int(settings.scoring.get("new_contact", 10))))
+
+    result.reasons.extend(extra)
+    result.score += sum(r.score for r in extra)
+    result.severity = severity_for(result.score)
+    result.suspicious = result.score >= int(settings.monitor.get("alert_threshold", 35))
+
+    if not result.reasons:
+        return
+
+    reason_strings = [f"{r.code}: {r.detail}" for r in result.reasons]
+    db.add_event(
+        event_type="message",
+        severity=result.severity,
+        score=result.score,
+        author_id=author_id,
+        guild_id=guild_id,
+        channel_id=channel_id,
+        message_id=str(getattr(message, "id", "")),
+        direction=direction,
+        summary=reason_strings[0],
+        reasons=reason_strings,
+        domains=result.domains,
+        content_redacted=result.redacted_text[: int(settings.monitor.get("log_content_max_chars", 500))],
     )
 
-    if (
-        getattr(message.channel, "id", None) == TARGET_CHANNEL_ID
-        and content.startswith(ALERT_MARKER)
-    ):
+    if not result.suspicious:
         return
 
-    is_suspicious, reasons = evaluate_content(content)
-    if not is_suspicious:
-        return
-
-    alert_payload = {
+    await send_alert({
         "event": "suspicious_message",
-        "message_id": str(message.id),
-        "author_id": str(author_id),
-        "channel_id": str(message.channel.id),
-        "guild_id": str(message.guild.id) if message.guild else None,
-        "guild_name": message.guild.name if message.guild else None,
-        "content": content[:1000],
-        "reasons": reasons,
-    }
-
-    alert_channel = client.get_channel(TARGET_CHANNEL_ID)
-    if alert_channel is None:
-        try:
-            alert_channel = await client.fetch_channel(TARGET_CHANNEL_ID)
-        except Exception:
-            logger.exception("Unable to resolve target alert channel %s", TARGET_CHANNEL_ID)
-            return
-
-    alert_json = json.dumps(alert_payload, indent=2, ensure_ascii=False)
-    if len(alert_json) > 1800:
-        alert_payload["content"] = content[:300]
-        alert_json = json.dumps(alert_payload, indent=2, ensure_ascii=False)
-
-    try:
-        await alert_channel.send(
-            f"{ALERT_MARKER}\n```json\n{alert_json}\n```"
-        )
-        logger.info("Alert sent for message %s", message.id)
-    except Exception:
-        logger.exception("Failed to send alert for message %s", message.id)
+        "severity": result.severity,
+        "risk_score": result.score,
+        "direction": direction,
+        "message_id": str(getattr(message, "id", "")),
+        "author_id": author_id,
+        "guild_id": guild_id,
+        "guild_name": getattr(guild, "name", None),
+        "channel_id": channel_id,
+        "domains": result.domains,
+        "reasons": reason_strings,
+        "content": result.redacted_text[:700],
+    })
 
 
 @client.event
 async def on_guild_join(guild):
-    logger.info("GUILD JOIN | name=%r | id=%s", guild.name, guild.id)
+    db.upsert_guild(str(guild.id), guild.name, str(getattr(guild, "owner_id", "")) or None, getattr(guild, "member_count", None), True)
+    reasons = behavior.guild_join_reasons()
+    score = sum(r.score for r in reasons)
+    severity = severity_for(score)
+    db.add_event(event_type="guild_join", severity=severity, score=score, guild_id=str(guild.id), summary=f"Joined guild {guild.name}", reasons=[r.detail for r in reasons])
+    logger.info("GUILD JOIN | %s (%s)", guild.name, guild.id)
+    if score >= int(settings.monitor.get("alert_threshold", 35)):
+        await send_alert({"event": "guild_join_anomaly", "severity": severity, "risk_score": score, "guild_id": str(guild.id), "guild_name": guild.name, "reasons": [r.detail for r in reasons]})
+
+
+@client.event
+async def on_guild_remove(guild):
+    db.upsert_guild(str(guild.id), guild.name, str(getattr(guild, "owner_id", "")) or None, getattr(guild, "member_count", None), False)
+    db.add_event(event_type="guild_remove", severity="INFO", score=0, guild_id=str(guild.id), summary=f"Left/removed from guild {guild.name}")
+    logger.info("GUILD REMOVE | %s (%s)", guild.name, guild.id)
 
 
 def main():
     logger.info("Starting Discord monitor...")
-    client.run(TOKEN)
+    try:
+        client.run(settings.token)
+    finally:
+        db.close()
 
 
 if __name__ == "__main__":
