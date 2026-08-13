@@ -11,8 +11,6 @@ services:
       - ./data:/app/data
       - ./backups:/app/backups
       - ./config.yaml:/app/config.yaml:ro
-    ports:
-      - "${WEB_PUBLISH_ADDR:-127.0.0.1}:8080:8080"
     restart: unless-stopped
     read_only: true
     tmpfs:
