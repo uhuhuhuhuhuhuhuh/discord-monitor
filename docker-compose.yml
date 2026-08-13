@@ -1,0 +1,11 @@
+services:
+  discord-monitor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: discord-monitor
+    env_file:
+      - .env
+    volumes:
+      - ./logs:/app/logs
+    restart: unless-stopped
