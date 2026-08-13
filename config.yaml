@@ -2,9 +2,6 @@ monitor:
   alert_threshold: 35
   incident_threshold: 80
   log_content_max_chars: 500
-  dedupe_window_seconds: 1800
-  alert_cooldown_seconds: 120
-  baseline_window_messages: 100
   outgoing_velocity_window_seconds: 300
   outgoing_velocity_threshold: 12
   repeated_message_threshold: 4
@@ -33,7 +30,6 @@ scoring:
   risky_attachment: 40
   double_extension: 35
   secret_leak: 60
-  qr_url: 15
   outgoing_multiplier: 1.35
   new_contact: 10
   repeated_message: 25
@@ -43,17 +39,11 @@ scoring:
   new_account: 15
 
 features:
-  qr_scanning: true
-  external_reputation: false
-  virustotal: false
-  urlhaus: false
   webui: true
-  backups: true
-  emergency_snapshots: true
+  inventory_backups: true
 
 backup:
-  retention: 14
-  interval_hours: 24
+  snapshot_on_connect: true
   include_message_content: false
   directory: /app/backups
 
