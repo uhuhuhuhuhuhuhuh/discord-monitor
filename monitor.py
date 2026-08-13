@@ -3,9 +3,11 @@ import logging
 import logging.handlers
 import sys
 from datetime import datetime, timezone
+from pathlib import Path
 
 import discord
 
+from app.account_inventory import write_account_inventory
 from app.behavior import BehaviorTracker
 from app.config import load_settings
 from app.db import Database
@@ -58,6 +60,11 @@ async def on_ready():
     logger.info("Alert channel: %s", settings.target_channel_id)
     for guild in client.guilds:
         db.upsert_guild(str(guild.id), guild.name, str(getattr(guild, "owner_id", "")) or None, getattr(guild, "member_count", None), True)
+    try:
+        inventory = write_account_inventory(client, Path("/app/backups"))
+        logger.info("Wrote account inventory snapshot: %s", inventory)
+    except Exception:
+        logger.exception("Unable to write account inventory snapshot")
 
 
 @client.event
