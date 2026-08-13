@@ -1,8 +1,12 @@
 .env
-logs/
 __pycache__/
-*.pyc
-*.pyo
-*.log
+*.py[cod]
+.pytest_cache/
 .venv/
-venv/
+logs/*
+!logs/.gitkeep
+data/*
+!data/.gitkeep
+backups/*
+!backups/.gitkeep
+*.log
