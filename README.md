@@ -266,10 +266,11 @@ For remote administration, keep it bound to loopback and use an SSH tunnel rathe
 
 ## Creating a migration/recovery plan
 
-Find the latest inventory:
+Find the latest inventory on the Ubuntu host:
 
 ```bash
-ls -1t backups/account-inventory-*.json | head -n 1
+LATEST="$(basename "$(ls -1t backups/account-inventory-*.json | head -n 1)")"
+echo "$LATEST"
 ```
 
 Create a 30-minute paced checklist:
@@ -277,7 +278,7 @@ Create a 30-minute paced checklist:
 ```bash
 docker compose exec discord-monitor \
   python scripts/make_migration_plan.py \
-  "$(ls -1t /app/backups/account-inventory-*.json | head -n 1)" \
+  "/app/backups/$LATEST" \
   /app/backups/migration-plan.json \
   --minutes 30
 ```
